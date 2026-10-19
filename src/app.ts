@@ -4,6 +4,7 @@ import helmet from 'helmet';
 import { config, explorerUrl } from './config';
 import { EscrowStore, HttpError } from './store';
 import { openapi, docsHtml } from './openapi';
+import { PauseGuard } from './pauseGuard';
 
 const startedAt = Date.now();
 
@@ -23,13 +24,54 @@ const id = (req: Request) => {
   return n;
 };
 
-export function createApp(store: EscrowStore = new EscrowStore().seed()) {
+export class ContractPausedError extends HttpError {
+  constructor(public source: string) {
+    super(503, 'contract_paused', 'Contract mutations are currently paused');
+  }
+}
+
+export interface CreateAppOptions {
+  store?: EscrowStore;
+  pauseGuard?: PauseGuard;
+}
+
+export function createApp(optionsOrStore: EscrowStore | CreateAppOptions = new EscrowStore().seed()) {
+  let store: EscrowStore;
+  let pauseGuard: PauseGuard;
+
+  if (optionsOrStore instanceof EscrowStore) {
+    store = optionsOrStore;
+    pauseGuard = new PauseGuard();
+  } else {
+    store = optionsOrStore.store ?? new EscrowStore().seed();
+    pauseGuard = optionsOrStore.pauseGuard ?? new PauseGuard();
+  }
+
   const app = express();
   app.disable('x-powered-by');
   // CSP disabled so the /docs page can load Swagger UI from a CDN.
   app.use(helmet({ contentSecurityPolicy: false }));
   app.use(cors());
   app.use(express.json({ limit: '100kb' }));
+
+  const requireNotPaused = async (_req: Request, res: Response, next: NextFunction) => {
+    try {
+      const status = await pauseGuard.isPaused();
+      if (status.paused) {
+        res.setHeader('Retry-After', '60');
+        res.status(503).json({
+          error: 'contract_paused',
+          message: 'Contract mutations are currently paused',
+          source: status.source,
+          contractError: { name: 'Paused', code: 4 },
+        });
+        return;
+      }
+      next();
+    } catch (err) {
+      next(err);
+    }
+  };
 
   app.get(
     '/',
@@ -61,16 +103,22 @@ export function createApp(store: EscrowStore = new EscrowStore().seed()) {
     })),
   );
 
-  app.get(
-    '/health',
-    wrap(() => ({
-      status: 'ok',
-      version: config.version,
-      uptimeSeconds: Math.round((Date.now() - startedAt) / 1000),
-      storage: 'in-memory',
-      timestamp: new Date().toISOString(),
-    })),
-  );
+  app.get('/health', async (_req: Request, res: Response, next: NextFunction) => {
+    try {
+      const pauseStatus = await pauseGuard.isPaused();
+      res.json({
+        status: 'ok',
+        version: config.version,
+        uptimeSeconds: Math.round((Date.now() - startedAt) / 1000),
+        storage: 'in-memory',
+        paused: pauseStatus.paused,
+        pauseSource: pauseStatus.source,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
 
   app.get('/openapi.json', wrap(() => openapi));
   app.get(['/docs', '/docs/'], (_req, res) => {
@@ -78,15 +126,21 @@ export function createApp(store: EscrowStore = new EscrowStore().seed()) {
   });
 
   const v1 = express.Router();
-  v1.get(
-    '/chain',
-    wrap(() => ({
-      network: config.network,
-      rpcUrl: config.rpcUrl,
-      contractId: config.contractId,
-      explorer: explorerUrl(),
-    })),
-  );
+  v1.get('/chain', async (_req: Request, res: Response, next: NextFunction) => {
+    try {
+      const pauseStatus = await pauseGuard.isPaused();
+      res.json({
+        network: config.network,
+        rpcUrl: config.rpcUrl,
+        contractId: config.contractId,
+        explorer: explorerUrl(),
+        paused: pauseStatus.paused,
+        pauseSource: pauseStatus.source,
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
   v1.get('/stats', wrap(() => store.stats()));
   v1.get(
     '/contracts',
@@ -99,22 +153,25 @@ export function createApp(store: EscrowStore = new EscrowStore().seed()) {
   );
   v1.post(
     '/contracts',
+    requireNotPaused,
     wrap((req, res) => {
       res.status(201).json(store.create(req.body ?? {}));
     }),
   );
   v1.get('/contracts/:id', wrap((req) => store.get(id(req))));
-  v1.post('/contracts/:id/deposit', wrap((req) => store.deposit(id(req), req.body?.amount)));
+  v1.post('/contracts/:id/deposit', requireNotPaused, wrap((req) => store.deposit(id(req), req.body?.amount)));
   v1.post(
     '/contracts/:id/milestones/:index/release',
+    requireNotPaused,
     wrap((req) => store.release(id(req), Number(req.params.index))),
   );
   v1.post(
     '/contracts/:id/dispute',
+    requireNotPaused,
     wrap((req) => store.openDispute(id(req), req.body?.raisedBy, req.body?.reason)),
   );
   v1.post('/contracts/:id/resolve', wrap((req) => store.resolveDispute(id(req), req.body?.freelancerBps)));
-  v1.post('/contracts/:id/cancel', wrap((req) => store.cancel(id(req))));
+  v1.post('/contracts/:id/cancel', requireNotPaused, wrap((req) => store.cancel(id(req))));
   v1.post('/contracts/:id/reputation', wrap((req) => store.rate(id(req), req.body?.rating)));
   v1.get('/reputation/:address', wrap((req) => store.getReputation(req.params.address)));
   app.use('/api/v1', v1);
@@ -140,3 +197,4 @@ export function createApp(store: EscrowStore = new EscrowStore().seed()) {
 }
 
 export default createApp;
+
