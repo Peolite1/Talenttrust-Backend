@@ -40,6 +40,7 @@ export interface EscrowContract {
   status: ContractStatus;
   reputationIssued: boolean;
   dispute?: Dispute;
+  version: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -129,6 +130,7 @@ export class EscrowStore {
       releasedAmount: 0,
       status: 'Created',
       reputationIssued: false,
+      version: 1,
       createdAt: now,
       updatedAt: now,
     };
@@ -143,6 +145,7 @@ export class EscrowStore {
   }
 
   private touch(c: EscrowContract) {
+    c.version += 1;
     c.updatedAt = new Date().toISOString();
     return c;
   }

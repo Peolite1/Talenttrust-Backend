@@ -18,6 +18,8 @@ data is per-instance and resets on redeploy.
 
 ## Endpoints
 
+All `GET` endpoints for contracts return strong `ETag` and `Cache-Control: no-cache` headers and support `If-None-Match` conditional requests (returning `304 Not Modified` when matched). All `POST /api/v1/contracts/:id/*` mutation endpoints support `If-Match` for optimistic concurrency control (returning `412 Precondition Failed` on mismatch and `428 Precondition Required` when mandatory).
+
 | Method | Path | Description |
 | --- | --- | --- |
 | GET | `/` | Service info and endpoint list (JSON) |
@@ -26,14 +28,14 @@ data is per-instance and resets on redeploy.
 | GET | `/openapi.json` | OpenAPI 3 spec |
 | GET | `/api/v1/chain` | On-chain contract deployment info |
 | GET | `/api/v1/stats` | Aggregate statistics |
-| GET/POST | `/api/v1/contracts` | List (`?status=`, `?party=`) / create escrow contracts |
-| GET | `/api/v1/contracts/:id` | Get a contract |
-| POST | `/api/v1/contracts/:id/deposit` | `{ "amount": 100 }` |
-| POST | `/api/v1/contracts/:id/milestones/:index/release` | Release a milestone |
-| POST | `/api/v1/contracts/:id/dispute` | `{ "raisedBy": "G...", "reason": "..." }` |
-| POST | `/api/v1/contracts/:id/resolve` | `{ "freelancerBps": 5000 }` |
-| POST | `/api/v1/contracts/:id/cancel` | Cancel and refund |
-| POST | `/api/v1/contracts/:id/reputation` | `{ "rating": 5 }` |
+| GET/POST | `/api/v1/contracts` | List (`?status=`, `?party=`, `If-None-Match`) / create escrow contracts |
+| GET | `/api/v1/contracts/:id` | Get a contract (`If-None-Match`) |
+| POST | `/api/v1/contracts/:id/deposit` | `{ "amount": 100 }` (`If-Match`) |
+| POST | `/api/v1/contracts/:id/milestones/:index/release` | Release a milestone (`If-Match`) |
+| POST | `/api/v1/contracts/:id/dispute` | `{ "raisedBy": "G...", "reason": "..." }` (`If-Match`) |
+| POST | `/api/v1/contracts/:id/resolve` | `{ "freelancerBps": 5000 }` (`If-Match`) |
+| POST | `/api/v1/contracts/:id/cancel` | Cancel and refund (`If-Match`) |
+| POST | `/api/v1/contracts/:id/reputation` | `{ "rating": 5 }` (`If-Match`) |
 | GET | `/api/v1/reputation/:address` | Freelancer reputation |
 
 ## Development
@@ -47,7 +49,7 @@ npm run build && npm start
 ```
 
 Configuration (all optional, see `.env.example`): `PORT`, `ESCROW_CONTRACT_ID`, `STELLAR_NETWORK`,
-`STELLAR_RPC_URL`, `FRONTEND_URL`.
+`STELLAR_RPC_URL`, `FRONTEND_URL`, `REQUIRE_IF_MATCH`.
 
 ## Deployment
 
