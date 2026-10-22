@@ -28,14 +28,16 @@ When the escrow contract is paused on-chain or via the `API_PAUSED=true` operato
 | GET | `/openapi.json` | OpenAPI 3 spec |
 | GET | `/api/v1/chain` | On-chain contract deployment info (includes `paused` and `pauseSource`) |
 | GET | `/api/v1/stats` | Aggregate statistics |
-| GET/POST | `/api/v1/contracts` | List (`?status=`, `?party=`) / create escrow contracts (guarded by pause) |
+| GET/POST | `/api/v1/contracts` | List (`?status=`, `?party=`, `?linked=true\|false`) / create escrow contracts |
 | GET | `/api/v1/contracts/:id` | Get a contract |
-| POST | `/api/v1/contracts/:id/deposit` | `{ "amount": 100 }` (guarded by pause) |
-| POST | `/api/v1/contracts/:id/milestones/:index/release` | Release a milestone (guarded by pause) |
-| POST | `/api/v1/contracts/:id/dispute` | `{ "raisedBy": "G...", "reason": "..." }` (guarded by pause) |
-| POST | `/api/v1/contracts/:id/resolve` | `{ "freelancerBps": 5000 }` (allowed while paused) |
-| POST | `/api/v1/contracts/:id/cancel` | Cancel and refund (guarded by pause) |
-| POST | `/api/v1/contracts/:id/reputation` | `{ "rating": 5 }` (allowed while paused) |
+| POST | `/api/v1/contracts/:id/deposit` | `{ "amount": 100 }` |
+| POST | `/api/v1/contracts/:id/milestones/:index/release` | Release a milestone |
+| POST | `/api/v1/contracts/:id/dispute` | `{ "raisedBy": "G...", "reason": "..." }` |
+| POST | `/api/v1/contracts/:id/resolve` | `{ "freelancerBps": 5000 }` |
+| POST | `/api/v1/contracts/:id/cancel` | Cancel and refund |
+| POST | `/api/v1/contracts/:id/reputation` | `{ "rating": 5 }` |
+| POST | `/api/v1/contracts/:id/link` | Link to on-chain escrow `{ "escrowId": "3" }` |
+| GET | `/api/v1/contracts/:id/parity` | Parity check report against on-chain state |
 | GET | `/api/v1/reputation/:address` | Freelancer reputation |
 
 ## Development
@@ -48,19 +50,22 @@ npm test
 npm run build && npm start
 ```
 
-### Configuration
+Configuration (all optional, see `.env.example`): `PORT`, `LOG_LEVEL` (debug|info|warn|error|silent, default info; silent in tests),
+`ESCROW_CONTRACT_ID`, `STELLAR_NETWORK`, `STELLAR_RPC_URL`, `FRONTEND_URL`.
 
-All optional (see `.env.example`):
-- `PORT`: HTTP port (default `3001`).
-- `ESCROW_CONTRACT_ID`: Soroban contract ID.
-- `STELLAR_NETWORK`: Stellar network (`testnet` / `mainnet`).
-- `STELLAR_RPC_URL`: Soroban RPC endpoint URL.
-- `FRONTEND_URL`: Hosted frontend URL.
-- `API_PAUSED`: Boolean operator override (`true` rejects mutations immediately without contacting RPC).
-- `PAUSE_CHECK_TTL_MS`: Cache TTL in milliseconds for on-chain pause status check (default `10000`).
-- `PAUSE_FAIL_MODE`: `open` or `closed` (default `open`).
-  - `open` (Fail-Open): If Soroban RPC is unreachable or times out, requests are allowed. Keeps the API available during transient RPC hiccups.
-  - `closed` (Fail-Closed): If Soroban RPC is unreachable or times out, guarded mutations are blocked (`503`). Recommended for high-security environments where unverified chain status cannot be permitted.
+Every request is assigned a correlation id. Send `X-Request-Id` (must match `^[A-Za-z0-9._-]{8,128}$`) and it is echoed back in the
+`X-Request-Id` response header and included in every error JSON body. Access logs are emitted as structured JSON (one line per request) and
+unexpected 500s are logged with a stack trace (never leaked to the client). Authorization, `x-api-key` and `Cookie` header values are redacted
+and request bodies are never logged.
+
+Standalone server timeouts (env, all optional): `KEEP_ALIVE_TIMEOUT_MS` (default 65000),
+`HEADERS_TIMEOUT_MS` (default 66000, must be > keep-alive), `REQUEST_TIMEOUT_MS` (default 30000).
+`SHUTDOWN_GRACE_MS` (default 10000) controls how long to wait for in-flight requests on shutdown.
+`PORT` is validated: non-integer or out-of-range (1–65535) values cause a fast fail with a clear message.
+
+On SIGTERM/SIGINT the server stops accepting connections, sets `Connection: close` on responses,
+returns `503 { status: 'draining' }` from `/health` while draining, waits for in-flight requests up to
+the grace deadline, then force-closes remaining sockets and exits.
 
 ## Deployment
 
