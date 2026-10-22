@@ -5,13 +5,25 @@ import crypto from 'crypto';
 import { config, explorerUrl } from './config';
 import { EscrowStore, EscrowContract, HttpError } from './store';
 import { openapi, docsHtml } from './openapi';
+import { createLogger, type Logger, randomUUID } from './logger';
+import { ChainReader, SorobanRpcChainReader } from './chain';
+
+declare global {
+  namespace Express {
+    interface Request {
+      id?: string;
+    }
+  }
+}
 
 const startedAt = Date.now();
 
-type Handler = (req: Request, res: Response) => unknown;
-const wrap = (fn: Handler) => (req: Request, res: Response, next: NextFunction) => {
+type LoggerLevel = 'debug' | 'info' | 'warn' | 'error';
+
+type Handler = (req: Request, res: Response) => unknown | Promise<unknown>;
+const wrap = (fn: Handler) => async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const out = fn(req, res);
+    const out = await fn(req, res);
     if (out !== undefined && !res.headersSent) res.json(out);
   } catch (err) {
     next(err);
@@ -24,36 +36,74 @@ const id = (req: Request) => {
   return n;
 };
 
-export function getContractEtag(contract: { id: number; version: number }): string {
-  return `"${contract.id}-${contract.version}"`;
-}
+const REQUEST_ID_RE = /^[A-Za-z0-9._-]{8,128}$/;
 
-export function getContractsListEtag(contracts: EscrowContract[], queryString: string = ''): string {
-  const pairs = contracts.map((c) => `${c.id}:${c.version}`).join(',');
-  const hash = crypto.createHash('sha1').update(`${pairs}?${queryString}`).digest('hex');
-  return `"${hash}"`;
-}
-
-export class PreconditionFailedError extends HttpError {
-  constructor(public currentEtag: string, public currentVersion: number) {
-    super(412, 'precondition_failed', 'Precondition failed');
+function resolveStoreAndLogger(
+  storeOrOpts: EscrowStore | { logger?: Logger; store?: EscrowStore; chainReader?: ChainReader } = new EscrowStore().seed(),
+): { store: EscrowStore; logger: Logger; chainReader: ChainReader } {
+  if (
+    storeOrOpts &&
+    typeof storeOrOpts === 'object' &&
+    'list' in storeOrOpts &&
+    typeof (storeOrOpts as EscrowStore).list === 'function'
+  ) {
+    return { store: storeOrOpts as EscrowStore, logger: createLogger(), chainReader: new SorobanRpcChainReader() };
   }
+  const opts = (storeOrOpts as { logger?: Logger; store?: EscrowStore; chainReader?: ChainReader } | undefined) ?? {};
+  return {
+    store: opts.store ?? new EscrowStore().seed(),
+    logger: opts.logger ?? createLogger(),
+    chainReader: opts.chainReader ?? new SorobanRpcChainReader(),
+  };
 }
 
-export class PreconditionRequiredError extends HttpError {
-  constructor() {
-    super(428, 'precondition_required', 'If-Match header is required');
-  }
-}
+export function createApp(
+  storeOrOpts: EscrowStore | { logger?: Logger; store?: EscrowStore; chainReader?: ChainReader } = new EscrowStore().seed(),
+  fallbackChainReader?: ChainReader,
+) {
+  const resolved = resolveStoreAndLogger(storeOrOpts);
+  const store = resolved.store;
+  const logger = resolved.logger;
+  const chainReader = fallbackChainReader ?? resolved.chainReader;
 
-export function createApp(store: EscrowStore = new EscrowStore().seed()) {
   const app = express();
   app.set('etag', false);
   app.disable('x-powered-by');
-  // CSP disabled so the /docs page can load Swagger UI from a CDN.
+  // Correlation id: echo a valid inbound X-Request-Id, otherwise generate one.
+  // The regex excludes CR/LF so a client cannot inject log-line terminators.
+  app.use((req, res, next) => {
+    const incoming = req.headers['x-request-id'];
+    const value = Array.isArray(incoming) ? incoming[0] : incoming;
+    const requestId = value && REQUEST_ID_RE.test(value) ? (value as string) : randomUUID();
+    req.id = requestId;
+    res.set('X-Request-Id', requestId);
+    next();
+  });
+
   app.use(helmet({ contentSecurityPolicy: false }));
   app.use(cors());
   app.use(express.json({ limit: '100kb' }));
+
+  // Structured access log on response finish.
+  app.use((req, res, next) => {
+    const start = Date.now();
+    res.on('finish', () => {
+      const durationMs = Date.now() - start;
+      const route = req.route ? req.baseUrl + req.route.path : 'unmatched';
+      let level: LoggerLevel = 'info';
+      if (res.statusCode >= 500) level = 'error';
+      else if (res.statusCode >= 429) level = 'warn';
+      logger[level]('request', {
+        method: req.method,
+        path: route,
+        status: res.statusCode,
+        durationMs,
+        contentLength: res.get('content-length') ?? undefined,
+        ip: req.ip,
+      });
+    });
+    next();
+  });
 
   app.get(
     '/',
@@ -80,21 +130,26 @@ export function createApp(store: EscrowStore = new EscrowStore().seed()) {
         'POST /api/v1/contracts/:id/resolve',
         'POST /api/v1/contracts/:id/cancel',
         'POST /api/v1/contracts/:id/reputation',
+        'POST /api/v1/contracts/:id/link',
+        'GET  /api/v1/contracts/:id/parity',
         'GET  /api/v1/reputation/:address',
       ],
     })),
   );
 
-  app.get(
-    '/health',
-    wrap(() => ({
+  app.get('/health', (req, res) => {
+    if (app.get('draining')) {
+      res.status(503).setHeader('Connection', 'close').json({ status: 'draining' });
+      return;
+    }
+    res.json({
       status: 'ok',
       version: config.version,
       uptimeSeconds: Math.round((Date.now() - startedAt) / 1000),
       storage: 'in-memory',
       timestamp: new Date().toISOString(),
-    })),
-  );
+    });
+  });
 
   app.get('/openapi.json', wrap(() => openapi));
   app.get(['/docs', '/docs/'], (_req, res) => {
@@ -114,34 +169,18 @@ export function createApp(store: EscrowStore = new EscrowStore().seed()) {
   v1.get('/stats', wrap(() => store.stats()));
   v1.get(
     '/contracts',
-    (req: Request, res: Response, next: NextFunction) => {
-      try {
-        const contracts = store.list({
+    wrap((req) => {
+      let linked: boolean | undefined = undefined;
+      if (req.query.linked === 'true') linked = true;
+      else if (req.query.linked === 'false') linked = false;
+      return {
+        data: store.list({
           status: typeof req.query.status === 'string' ? req.query.status : undefined,
           party: typeof req.query.party === 'string' ? req.query.party : undefined,
-        });
-        const qs = req.url.includes('?') ? req.url.split('?')[1] : '';
-        const etag = getContractsListEtag(contracts, qs);
-        res.setHeader('ETag', etag);
-        res.setHeader('Cache-Control', 'no-cache');
-
-        const ifNoneMatch = req.headers['if-none-match'];
-        if (ifNoneMatch) {
-          const clientEtags = ifNoneMatch
-            .split(',')
-            .map((s) => s.trim())
-            .map((s) => (s.startsWith('W/') ? s.slice(2) : s));
-          if (clientEtags.includes(etag) || clientEtags.includes('*')) {
-            res.status(304).end();
-            return;
-          }
-        }
-
-        res.json({ data: contracts });
-      } catch (err) {
-        next(err);
-      }
-    },
+          linked,
+        }),
+      };
+    }),
   );
   v1.post(
     '/contracts',
@@ -261,40 +300,44 @@ export function createApp(store: EscrowStore = new EscrowStore().seed()) {
       return rep;
     }),
   );
+  v1.post('/contracts/:id/resolve', wrap((req) => store.resolveDispute(id(req), req.body?.freelancerBps)));
+  v1.post('/contracts/:id/cancel', wrap((req) => store.cancel(id(req))));
+  v1.post('/contracts/:id/reputation', wrap((req) => store.rate(id(req), req.body?.rating)));
+  v1.post(
+    '/contracts/:id/link',
+    wrap(async (req) => store.linkEscrow(id(req), req.body?.escrowId, chainReader)),
+  );
+  v1.get(
+    '/contracts/:id/parity',
+    wrap(async (req) => store.checkParity(id(req), chainReader)),
+  );
   v1.get('/reputation/:address', wrap((req) => store.getReputation(req.params.address)));
   app.use('/api/v1', v1);
 
   app.use((req, res) => {
-    res.status(404).json({ error: 'not_found', message: `No route for ${req.method} ${req.path}`, docs: '/docs' });
+    res.status(404).json({ error: 'not_found', message: `No route for ${req.method} ${req.path}`, requestId: req.id, docs: '/docs' });
   });
 
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
-    if (err instanceof PreconditionFailedError) {
-      res.setHeader('ETag', err.currentEtag);
-      res.status(412).json({
-        error: err.code,
-        message: err.message,
-        currentVersion: err.currentVersion,
-      });
-      return;
-    }
-    if (err instanceof PreconditionRequiredError) {
-      res.status(428).json({
-        error: err.code,
-        message: err.message,
-      });
-      return;
-    }
+  app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
+    const requestId = req.id;
     if (err instanceof HttpError) {
-      res.status(err.status).json({ error: err.code, message: err.message });
+      res.status(err.status).json({ error: err.code, message: err.message, ...err.details, requestId });
       return;
     }
     if (err && typeof err === 'object' && (err as { type?: string }).type === 'entity.parse.failed') {
-      res.status(400).json({ error: 'invalid_json', message: 'Malformed JSON body' });
+      res.status(400).json({ error: 'invalid_json', message: 'Malformed JSON body', requestId });
       return;
     }
-    res.status(500).json({ error: 'internal_error', message: 'Unexpected error' });
+    logger.error('unhandled_error', {
+      requestId,
+      err: {
+        name: (err as Error)?.name ?? 'Error',
+        message: (err as Error)?.message ?? String(err),
+        stack: (err as Error)?.stack,
+      },
+    });
+    res.status(500).json({ error: 'internal_error', message: 'Unexpected error', requestId });
   });
 
   return app;
