@@ -55,6 +55,7 @@ export interface EscrowContract {
   reputationIssued: boolean;
   dispute?: Dispute;
   chain?: ChainInfo;
+  version: number;
   createdAt: string;
   updatedAt: string;
 }

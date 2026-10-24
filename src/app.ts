@@ -36,6 +36,28 @@ const id = (req: Request) => {
   return n;
 };
 
+export function getContractEtag(contract: { id: number; version: number }): string {
+  return `"${contract.id}-${contract.version}"`;
+}
+
+export function getContractsListEtag(contracts: EscrowContract[], queryString: string = ''): string {
+  const pairs = contracts.map((c) => `${c.id}:${c.version}`).join(',');
+  const hash = crypto.createHash('sha1').update(`${pairs}?${queryString}`).digest('hex');
+  return `"${hash}"`;
+}
+
+export class PreconditionFailedError extends HttpError {
+  constructor(public currentEtag: string, public currentVersion: number) {
+    super(412, 'precondition_failed', 'Precondition failed');
+  }
+}
+
+export class PreconditionRequiredError extends HttpError {
+  constructor() {
+    super(428, 'precondition_required', 'If-Match header is required');
+  }
+}
+
 const REQUEST_ID_RE = /^[A-Za-z0-9._-]{8,128}$/;
 
 function resolveStoreAndLogger(
@@ -169,18 +191,38 @@ export function createApp(
   v1.get('/stats', wrap(() => store.stats()));
   v1.get(
     '/contracts',
-    wrap((req) => {
-      let linked: boolean | undefined = undefined;
-      if (req.query.linked === 'true') linked = true;
-      else if (req.query.linked === 'false') linked = false;
-      return {
-        data: store.list({
+    (req: Request, res: Response, next: NextFunction) => {
+      try {
+        let linked: boolean | undefined = undefined;
+        if (req.query.linked === 'true') linked = true;
+        else if (req.query.linked === 'false') linked = false;
+        const contracts = store.list({
           status: typeof req.query.status === 'string' ? req.query.status : undefined,
           party: typeof req.query.party === 'string' ? req.query.party : undefined,
           linked,
-        }),
-      };
-    }),
+        });
+        const qs = req.url.includes('?') ? req.url.split('?')[1] : '';
+        const etag = getContractsListEtag(contracts, qs);
+        res.setHeader('ETag', etag);
+        res.setHeader('Cache-Control', 'no-cache');
+
+        const ifNoneMatch = req.headers['if-none-match'];
+        if (ifNoneMatch) {
+          const clientEtags = ifNoneMatch
+            .split(',')
+            .map((s) => s.trim())
+            .map((s) => (s.startsWith('W/') ? s.slice(2) : s));
+          if (clientEtags.includes(etag) || clientEtags.includes('*')) {
+            res.status(304).end();
+            return;
+          }
+        }
+
+        res.json({ data: contracts });
+      } catch (err) {
+        next(err);
+      }
+    },
   );
   v1.post(
     '/contracts',
@@ -300,9 +342,6 @@ export function createApp(
       return rep;
     }),
   );
-  v1.post('/contracts/:id/resolve', wrap((req) => store.resolveDispute(id(req), req.body?.freelancerBps)));
-  v1.post('/contracts/:id/cancel', wrap((req) => store.cancel(id(req))));
-  v1.post('/contracts/:id/reputation', wrap((req) => store.rate(id(req), req.body?.rating)));
   v1.post(
     '/contracts/:id/link',
     wrap(async (req) => store.linkEscrow(id(req), req.body?.escrowId, chainReader)),
@@ -321,6 +360,22 @@ export function createApp(
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
     const requestId = req.id;
+    if (err instanceof PreconditionFailedError) {
+      res.setHeader('ETag', err.currentEtag);
+      res.status(412).json({
+        error: err.code,
+        message: err.message,
+        currentVersion: err.currentVersion,
+      });
+      return;
+    }
+    if (err instanceof PreconditionRequiredError) {
+      res.status(428).json({
+        error: err.code,
+        message: err.message,
+      });
+      return;
+    }
     if (err instanceof HttpError) {
       res.status(err.status).json({ error: err.code, message: err.message, ...err.details, requestId });
       return;

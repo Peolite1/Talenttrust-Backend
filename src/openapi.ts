@@ -79,6 +79,7 @@ export const openapi = {
           { name: 'status', in: 'query', schema: { type: 'string' } },
           { name: 'party', in: 'query', schema: { type: 'string' }, description: 'Client or freelancer address' },
           { name: 'linked', in: 'query', schema: { type: 'boolean' }, description: 'Filter by whether contract is linked to on-chain escrow' },
+          ifNoneMatchHeader,
         ],
         responses: {
           200: {
@@ -294,6 +295,15 @@ export const openapi = {
         },
         required: ['error', 'message'],
       },
+      PreconditionFailedResponse: {
+        type: 'object',
+        properties: {
+          error: { type: 'string' },
+          message: { type: 'string' },
+          currentVersion: { type: 'integer' },
+        },
+        required: ['error', 'message', 'currentVersion'],
+      },
       ChainMismatchError: {
         type: 'object',
         properties: {
@@ -332,6 +342,7 @@ export const openapi = {
           status: { type: 'string', enum: ['Created', 'Funded', 'Completed', 'Disputed', 'Resolved', 'Cancelled'] },
           reputationIssued: { type: 'boolean' },
           chain: { $ref: '#/components/schemas/ChainInfo' },
+          version: { type: 'integer' },
           createdAt: { type: 'string', format: 'date-time' },
           updatedAt: { type: 'string', format: 'date-time' },
         },
