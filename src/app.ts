@@ -6,6 +6,7 @@ import { EscrowStore, HttpError } from './store';
 import { openapi, docsHtml } from './openapi';
 import { createLogger, type Logger, randomUUID } from './logger';
 import { ChainReader, SorobanRpcChainReader } from './chain';
+import { PauseGuard } from './pauseGuard';
 
 declare global {
   namespace Express {
@@ -37,33 +38,53 @@ const id = (req: Request) => {
 
 const REQUEST_ID_RE = /^[A-Za-z0-9._-]{8,128}$/;
 
+export class ContractPausedError extends HttpError {
+  constructor(public source: string) {
+    super(503, 'contract_paused', 'Contract mutations are currently paused');
+  }
+}
+
+export interface CreateAppOptions {
+  store?: EscrowStore;
+  logger?: Logger;
+  chainReader?: ChainReader;
+  pauseGuard?: PauseGuard;
+}
+
 function resolveStoreAndLogger(
-  storeOrOpts: EscrowStore | { logger?: Logger; store?: EscrowStore; chainReader?: ChainReader } = new EscrowStore().seed(),
-): { store: EscrowStore; logger: Logger; chainReader: ChainReader } {
+  storeOrOpts: EscrowStore | CreateAppOptions = new EscrowStore().seed(),
+): { store: EscrowStore; logger: Logger; chainReader: ChainReader; pauseGuard: PauseGuard } {
   if (
     storeOrOpts &&
     typeof storeOrOpts === 'object' &&
     'list' in storeOrOpts &&
     typeof (storeOrOpts as EscrowStore).list === 'function'
   ) {
-    return { store: storeOrOpts as EscrowStore, logger: createLogger(), chainReader: new SorobanRpcChainReader() };
+    return {
+      store: storeOrOpts as EscrowStore,
+      logger: createLogger(),
+      chainReader: new SorobanRpcChainReader(),
+      pauseGuard: new PauseGuard(),
+    };
   }
-  const opts = (storeOrOpts as { logger?: Logger; store?: EscrowStore; chainReader?: ChainReader } | undefined) ?? {};
+  const opts = (storeOrOpts as CreateAppOptions | undefined) ?? {};
   return {
     store: opts.store ?? new EscrowStore().seed(),
     logger: opts.logger ?? createLogger(),
     chainReader: opts.chainReader ?? new SorobanRpcChainReader(),
+    pauseGuard: opts.pauseGuard ?? new PauseGuard(),
   };
 }
 
 export function createApp(
-  storeOrOpts: EscrowStore | { logger?: Logger; store?: EscrowStore; chainReader?: ChainReader } = new EscrowStore().seed(),
+  storeOrOpts: EscrowStore | CreateAppOptions = new EscrowStore().seed(),
   fallbackChainReader?: ChainReader,
 ) {
   const resolved = resolveStoreAndLogger(storeOrOpts);
   const store = resolved.store;
   const logger = resolved.logger;
   const chainReader = fallbackChainReader ?? resolved.chainReader;
+  const pauseGuard = resolved.pauseGuard;
 
   const app = express();
   app.disable('x-powered-by');
@@ -103,6 +124,25 @@ export function createApp(
     next();
   });
 
+  const requireNotPaused = async (_req: Request, res: Response, next: NextFunction) => {
+    try {
+      const status = await pauseGuard.isPaused();
+      if (status.paused) {
+        res.setHeader('Retry-After', '60');
+        res.status(503).json({
+          error: 'contract_paused',
+          message: 'Contract mutations are currently paused',
+          source: status.source,
+          contractError: { name: 'Paused', code: 4 },
+        });
+        return;
+      }
+      next();
+    } catch (err) {
+      next(err);
+    }
+  };
+
   app.get(
     '/',
     wrap(() => ({
@@ -135,18 +175,25 @@ export function createApp(
     })),
   );
 
-  app.get('/health', (req, res) => {
+  app.get('/health', async (req: Request, res: Response, next: NextFunction) => {
     if (app.get('draining')) {
       res.status(503).setHeader('Connection', 'close').json({ status: 'draining' });
       return;
     }
-    res.json({
-      status: 'ok',
-      version: config.version,
-      uptimeSeconds: Math.round((Date.now() - startedAt) / 1000),
-      storage: 'in-memory',
-      timestamp: new Date().toISOString(),
-    });
+    try {
+      const pauseStatus = await pauseGuard.isPaused();
+      res.json({
+        status: 'ok',
+        version: config.version,
+        uptimeSeconds: Math.round((Date.now() - startedAt) / 1000),
+        storage: 'in-memory',
+        paused: pauseStatus.paused,
+        pauseSource: pauseStatus.source,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err) {
+      next(err);
+    }
   });
 
   app.get('/openapi.json', wrap(() => openapi));
@@ -249,4 +296,3 @@ export function createApp(
 }
 
 export default createApp;
-

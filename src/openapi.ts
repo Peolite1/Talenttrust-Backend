@@ -243,6 +243,21 @@ export const openapi = {
   },
   components: {
     schemas: {
+      PausedErrorResponse: {
+        type: 'object',
+        properties: {
+          error: { type: 'string', example: 'contract_paused' },
+          message: { type: 'string', example: 'Contract mutations are currently paused' },
+          source: { type: 'string', enum: ['chain', 'env', 'none'] },
+          contractError: {
+            type: 'object',
+            properties: {
+              name: { type: 'string', example: 'Paused' },
+              code: { type: 'integer', example: 4 },
+            },
+          },
+        },
+      },
       DriftItem: {
         type: 'object',
         properties: {
