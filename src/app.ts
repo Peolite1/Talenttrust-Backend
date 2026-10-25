@@ -3,7 +3,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import compression from 'compression';
 import { config, explorerUrl } from './config';
-import { EscrowStore, EscrowContract, HttpError } from './store';
+import { EscrowStore, HttpError, LIST_STATUSES, type Cursor, type EscrowContract, type QueryFilters } from './store';
 import { openapi, docsHtml } from './openapi';
 import { validate } from './validation/middleware';
 import {
@@ -24,11 +24,14 @@ import { createLogger, type Logger, randomUUID } from './logger';
 import { ChainReader, SorobanRpcChainReader } from './chain';
 import { buildEscrowTransaction, TxBuildError, type RpcClient } from './stellar/escrowTxBuilder';
 import { bigIntReplacer } from './amount';
+import { createRegistry, type Registry, HTTP_DURATION_BUCKETS, constantTimeEqual } from './metrics';
+import { createHash, createHmac, timingSafeEqual } from 'crypto';
 import { StrKey, Keypair } from '@stellar/stellar-sdk';
 import { randomBytes } from 'crypto';
 import { buildChallenge, verifyChallenge, consumeNonce } from './auth/challenge';
 import { issueWalletToken } from './auth/jwt';
 import { createRequireAuth, WalletAuthRequest } from './auth/middleware';
+import { ReceiptManager, hashContractState, verifyReceipt } from './receipts';
 
 declare global {
   namespace Express {
@@ -76,7 +79,143 @@ function parseFields(req: Request) {
   return parseFieldSpec(raw);
 }
 
+/** Bearer check for the cron sweep; fails closed (404) when CRON_SECRET is unset. */
+const requireCronSecret = (req: Request) => {
+  const expected = process.env.CRON_SECRET;
+  if (!expected) throw new HttpError(404, 'not_found', 'Cron endpoint is not configured');
+  const supplied = req.get('authorization')?.match(/^Bearer\s+(.+)$/i)?.[1];
+  if (!supplied) throw new HttpError(401, 'cron_unauthorized', 'Valid bearer authorization is required');
+  // Compare fixed-length digests so the comparison is constant-time and length-independent.
+  const expectedBytes = createHash('sha256').update(expected).digest();
+  const suppliedBytes = createHash('sha256').update(supplied).digest();
+  if (!timingSafeEqual(expectedBytes, suppliedBytes)) {
+    throw new HttpError(401, 'cron_unauthorized', 'Valid bearer authorization is required');
+  }
+};
+
 const REQUEST_ID_RE = /^[A-Za-z0-9._-]{8,128}$/;
+
+// --- ETag caching and If-Match optimistic concurrency ---
+
+/** Strong entity tag for a contract: `"<id>-<version>"`. */
+export function getContractEtag(contract: { id: number; version: number }): string {
+  return `"${contract.id}-${contract.version}"`;
+}
+
+/** List entity tag: hash of every listed (id, version) pair plus the query string. */
+export function getContractsListEtag(contracts: Array<{ id: number; version: number }>, queryString = ''): string {
+  const pairs = contracts.map((c) => `${c.id}:${c.version}`).join(',');
+  return `"${createHash('sha1').update(`${pairs}?${queryString}`).digest('hex')}"`;
+}
+
+export class PreconditionFailedError extends HttpError {
+  constructor(
+    public currentEtag: string,
+    public currentVersion: number,
+  ) {
+    super(412, 'precondition_failed', 'Precondition failed');
+  }
+}
+
+export class PreconditionRequiredError extends HttpError {
+  constructor() {
+    super(428, 'precondition_required', 'If-Match header is required');
+  }
+}
+
+/** Parse an If-None-Match / If-Match header into opaque tags (weak prefixes stripped). */
+const parseEtagList = (header: string | undefined): string[] =>
+  (header ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((s) => (s.startsWith('W/') ? s.slice(2) : s));
+
+/** Set ETag + Cache-Control and answer 304 when If-None-Match matches. Returns true when handled. */
+function conditionalGet(req: Request, res: Response, etag: string): boolean {
+  res.setHeader('ETag', etag);
+  res.setHeader('Cache-Control', 'no-cache');
+  const tags = parseEtagList(req.headers['if-none-match']);
+  if (tags.includes(etag) || tags.includes('*')) {
+    res.status(304).end();
+    return true;
+  }
+  return false;
+}
+
+// --- Contract list pagination (cursor = base64url JSON + HMAC, so clients cannot forge it) ---
+
+const CURSOR_SECRET = process.env.CURSOR_SECRET || randomBytes(32).toString('base64url');
+
+function safeEqual(a: string, b: string): boolean {
+  const ba = Buffer.from(a, 'utf8');
+  const bb = Buffer.from(b, 'utf8');
+  return ba.length === bb.length && timingSafeEqual(ba, bb);
+}
+
+function parseLimit(v: unknown): number {
+  if (v === undefined) return 20;
+  const n = Number(v);
+  if (typeof v !== 'string' || !Number.isInteger(n) || n < 1 || n > 100) {
+    throw new HttpError(400, 'invalid_query', 'limit must be an integer between 1 and 100');
+  }
+  return n;
+}
+
+function parseSortParam(v: unknown): string {
+  if (v === undefined) return '-createdAt';
+  const s = String(v);
+  const field = s.startsWith('-') ? s.slice(1) : s;
+  if (!['createdAt', 'updatedAt', 'totalAmount'].includes(field)) {
+    throw new HttpError(400, 'invalid_query', 'sort must be one of createdAt, updatedAt, totalAmount (prefix - for descending)');
+  }
+  return s;
+}
+
+function serializeCursor(cursor: Cursor): string {
+  const payload = Buffer.from(JSON.stringify(cursor)).toString('base64url');
+  const sig = createHmac('sha256', CURSOR_SECRET).update(payload).digest('base64url');
+  return `${payload}.${sig}`;
+}
+
+function parseCursorParam(cursor: unknown, sort: string): Cursor | undefined {
+  if (cursor === undefined || cursor === '') return undefined;
+  const parts = String(cursor).split('.');
+  if (parts.length !== 2) throw new HttpError(400, 'invalid_cursor', 'invalid cursor');
+  const [payload, sig] = parts;
+  const expected = createHmac('sha256', CURSOR_SECRET).update(payload).digest('base64url');
+  if (!safeEqual(sig, expected)) throw new HttpError(400, 'invalid_cursor', 'invalid cursor');
+  let obj: { sort?: unknown; lastValue?: unknown; lastId?: unknown };
+  try {
+    obj = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+  } catch {
+    throw new HttpError(400, 'invalid_cursor', 'invalid cursor');
+  }
+  if (obj.sort !== sort) throw new HttpError(400, 'invalid_cursor', 'cursor sort does not match requested sort');
+  return { sort, lastValue: String(obj.lastValue ?? ''), lastId: Number(obj.lastId ?? 0) };
+}
+
+function parseFilters(q: Request['query']): QueryFilters {
+  const f: QueryFilters = {};
+  if (typeof q.status === 'string') {
+    f.status = q.status.split(',').map((s) => s.trim()).filter(Boolean);
+    for (const status of f.status) {
+      if (!(LIST_STATUSES as string[]).includes(status)) throw new HttpError(400, 'invalid_query', `invalid status ${status}`);
+    }
+  }
+  if (typeof q.party === 'string') f.party = q.party;
+  if (typeof q.role === 'string') {
+    if (f.party === undefined) throw new HttpError(400, 'invalid_query', 'role requires party');
+    if (q.role !== 'client' && q.role !== 'freelancer') throw new HttpError(400, 'invalid_query', 'role must be client or freelancer');
+    f.role = q.role;
+  }
+  if (typeof q.token === 'string') f.token = q.token;
+  if (typeof q.createdAfter === 'string') f.createdAfter = q.createdAfter;
+  if (typeof q.createdBefore === 'string') f.createdBefore = q.createdBefore;
+  if (q.linked === 'true') f.linked = true;
+  else if (q.linked === 'false') f.linked = false;
+  return f;
+}
 
 /** Validate that a string is a valid Stellar ed25519 public key (G…). */
 function isValidStellarAddress(addr: unknown): addr is string {
@@ -98,6 +237,10 @@ export type AppDeps = {
   authRequired?: boolean;
   /** Injectable clock for auth (tests). */
   now?: () => number;
+  /** Signs contract-state receipts; defaults to RECEIPT_SIGNING_SECRET or an ephemeral key. */
+  receiptManager?: ReceiptManager;
+  /** Prometheus registry; each app gets its own unless one is injected. */
+  registry?: Registry;
 };
 
 /**
@@ -136,23 +279,33 @@ function resolveStoreAndLogger(
 export interface AppOptions {
   idempotencyStore?: IdempotencyStore;
   idempotencyRequired?: boolean;
+  receiptManager?: ReceiptManager;
+  registry?: Registry;
 }
 
 export function createApp(
   storeOrOpts: EscrowStore | AppDeps = new EscrowStore().seed(),
-  fallbackChainReader?: ChainReader,
+  fallbackChainReaderOrReceiptManager?: ChainReader | ReceiptManager,
   options: AppOptions = {},
 ) {
   const resolved = resolveStoreAndLogger(storeOrOpts);
   const store = resolved.store;
   const logger = resolved.logger;
-  const chainReader = fallbackChainReader ?? resolved.chainReader;
+  const second = fallbackChainReaderOrReceiptManager;
+  const chainReader = second instanceof ReceiptManager ? resolved.chainReader : (second ?? resolved.chainReader);
   const txRpcServer = resolved.txRpcServer;
   const isDeps = !(storeOrOpts && typeof (storeOrOpts as EscrowStore).list === 'function');
-  const auth = resolveAuth(isDeps ? ((storeOrOpts as AppDeps | undefined) ?? {}) : {});
+  const deps: AppDeps = isDeps ? ((storeOrOpts as AppDeps | undefined) ?? {}) : {};
+  const auth = resolveAuth(deps);
+  // Created lazily so apps that never sign receipts don't generate a key (or warn).
+  let receiptManagerInstance: ReceiptManager | undefined =
+    second instanceof ReceiptManager ? second : (options.receiptManager ?? deps.receiptManager);
+  const receiptManager = () =>
+    (receiptManagerInstance ??= new ReceiptManager(process.env.RECEIPT_SIGNING_SECRET));
   const requireAuth = createRequireAuth(auth.secret, auth.now, auth.required);
 
   const app = express();
+  // Strong, version-based ETags are set explicitly on contract routes.
   app.set('etag', false);
   app.disable('x-powered-by');
   // Correlation id: echo a valid inbound X-Request-Id, otherwise generate one.
@@ -165,6 +318,36 @@ export function createApp(
     res.set('X-Request-Id', requestId);
     next();
   });
+
+  // HTTP RED metrics: request counter and latency histogram, labelled by route pattern.
+  const registry = options.registry ?? deps.registry ?? createRegistry();
+  const httpRequestsTotal = registry.counter('http_requests_total', 'Total number of HTTP requests', [
+    'method',
+    'route',
+    'status',
+  ]);
+  const httpRequestDuration = registry.histogram(
+    'http_request_duration_seconds',
+    'HTTP request duration in seconds',
+    ['method', 'route'],
+    HTTP_DURATION_BUCKETS,
+  );
+  app.use((req, res, next) => {
+    const start = Date.now();
+    res.on('finish', () => {
+      const route = req.route ? String(req.baseUrl || '') + String(req.route.path || '') : 'unmatched';
+      httpRequestsTotal.inc({ method: req.method, route, status: String(res.statusCode) });
+      httpRequestDuration.observe({ method: req.method, route }, (Date.now() - start) / 1000);
+    });
+    next();
+  });
+
+  // Domain mutation counter, incremented from the store layer.
+  const escrowMutationsTotal = registry.counter('escrow_mutations_total', 'Total number of escrow mutations', [
+    'action',
+    'result',
+  ]);
+  store.setMutationRecorder((action, result) => escrowMutationsTotal.inc({ action, result }));
 
   app.use(helmet({ contentSecurityPolicy: false }));
   app.use(cors());
@@ -209,6 +392,17 @@ export function createApp(
     next();
   });
 
+  const getOrigin = (req: Request) => `${req.protocol}://${req.get('host') || 'localhost'}`;
+
+  /** With `?receipt=true`, attach a `Receipt` header: a JWS over the post-mutation contract state. */
+  const maybeAttachReceipt = (req: Request, res: Response, contract: unknown) => {
+    if (req.query.receipt === 'true' && contract && typeof contract === 'object') {
+      res.setHeader('Receipt', receiptManager().issueReceipt(contract as Record<string, unknown>, getOrigin(req)));
+    }
+  };
+
+  app.get('/.well-known/talenttrust-receipts.json', wrap(() => receiptManager().getPublishedKeys()));
+
   app.get(
     '/',
     wrap(() => ({
@@ -223,16 +417,20 @@ export function createApp(
         'GET  /health',
         'GET  /docs',
         'GET  /openapi.json',
+        'GET  /metrics',
+        'GET  /.well-known/talenttrust-receipts.json',
         'GET  /api/v1/chain',
         'GET  /api/v1/stats',
         'POST /api/v1/tx/build',
         'GET  /api/v1/contracts',
         'POST /api/v1/contracts',
         'GET  /api/v1/contracts/:id',
+        'GET  /api/v1/contracts/:id/receipt',
         'PATCH /api/v1/contracts/:id',
         'DELETE /api/v1/contracts/:id',
         'GET  /api/v1/contracts/:id/revisions',
         'POST /api/v1/contracts/:id/deposit',
+        'POST /api/v1/contracts/:id/extend-deadline',
         'POST /api/v1/contracts/:id/milestones/:index/release',
         'POST /api/v1/contracts/:id/dispute',
         'POST /api/v1/contracts/:id/resolve',
@@ -245,6 +443,8 @@ export function createApp(
         'GET  /api/v1/reputation/:address/reviews',
         'GET  /api/v1/auth/challenge',
         'POST /api/v1/auth/token',
+        'POST /api/v1/receipts/verify',
+        'GET/POST /api/cron/expire-contracts',
       ],
     })),
   );
@@ -343,17 +543,19 @@ export function createApp(
   v1.get(
     '/contracts',
     validate({ query: ListQuery }),
-    wrap((req) => {
-      let linked: boolean | undefined = undefined;
-      if (req.query.linked === 'true') linked = true;
-      else if (req.query.linked === 'false') linked = false;
+    wrap((req, res) => {
+      const limit = parseLimit(req.query.limit);
+      const sort = parseSortParam(req.query.sort);
+      const after = parseCursorParam(req.query.cursor, sort);
+      const filters = parseFilters(req.query);
       const spec = parseFields(req);
-      const contracts = store.list({
-        status: req.query.status as string | undefined,
-        party: req.query.party as string | undefined,
-        linked,
-      });
-      return { data: contracts.map((c) => project(c, spec)) };
+      const result = store.query({ filters, sort, limit, after });
+      const qs = req.originalUrl.includes('?') ? req.originalUrl.split('?')[1] : '';
+      if (conditionalGet(req, res, getContractsListEtag(result.data, qs))) return undefined;
+      return {
+        data: result.data.map((c) => project(c, spec)),
+        page: { limit, nextCursor: result.nextCursor ? serializeCursor(result.nextCursor) : null, hasMore: result.hasMore },
+      };
     }),
   );
   v1.post(
@@ -374,14 +576,50 @@ export function createApp(
     },
     validate({ body: CreateContractBody }),
     wrap((req, res) => {
-      res.status(201).json(store.create(req.body));
+      const created = store.create(req.body);
+      res.setHeader('ETag', getContractEtag(created));
+      maybeAttachReceipt(req, res, created);
+      res.status(201).json(created);
     }),
   );
   v1.get(
     '/contracts/:id',
     validate({ params: IdParam }),
-    wrap((req) => project(store.get(Number(req.params.id)), parseFields(req))),
+    wrap((req, res) => {
+      const contract = store.get(Number(req.params.id));
+      if (conditionalGet(req, res, getContractEtag(contract))) return undefined;
+      return project(contract, parseFields(req));
+    }),
   );
+  v1.get(
+    '/contracts/:id/receipt',
+    wrap((req) => {
+      const contract = store.get(id(req));
+      return { receipt: receiptManager().issueReceipt(contract as unknown as Record<string, unknown>, getOrigin(req)) };
+    }),
+  );
+  /** If-Match check for contract mutations: 412 on a stale tag, 428 when REQUIRE_IF_MATCH=true and absent. */
+  const checkPreconditions = (req: Request, _res: Response, next: NextFunction) => {
+    try {
+      const contract = store.get(id(req));
+      const ifMatch = req.headers['if-match'];
+      if (!ifMatch) {
+        if (process.env.REQUIRE_IF_MATCH === 'true') throw new PreconditionRequiredError();
+      } else {
+        const current = getContractEtag(contract);
+        const tags = parseEtagList(ifMatch);
+        if (!tags.includes('*') && !tags.includes(current)) {
+          throw new PreconditionFailedError(current, contract.version);
+        }
+      }
+      next();
+    } catch (err) {
+      next(err);
+    }
+  };
+  /** Expose the post-mutation entity tag. */
+  const setEtag = (res: Response, contract: EscrowContract) => res.setHeader('ETag', getContractEtag(contract));
+
   // With wallet auth the authenticated address stands in for body.client.
   const clientOf = (req: Request): unknown => {
     const caller = callerOf(req);
@@ -394,11 +632,17 @@ export function createApp(
   v1.patch(
     '/contracts/:id',
     requireAuth,
-    wrap((req) => store.edit(id(req), { ...(req.body ?? {}), client: clientOf(req) })),
+    checkPreconditions,
+    wrap((req, res) => {
+      const updated = store.edit(id(req), { ...(req.body ?? {}), client: clientOf(req) });
+      setEtag(res, updated);
+      return updated;
+    }),
   );
   v1.delete(
     '/contracts/:id',
     requireAuth,
+    checkPreconditions,
     wrap((req, res) => {
       store.delete(id(req), clientOf(req));
       res.status(204).end();
@@ -406,39 +650,87 @@ export function createApp(
   );
   v1.get('/contracts/:id/revisions', wrap((req) => store.getRevisions(id(req))));
   v1.post(
+    '/contracts/:id/extend-deadline',
+    requireAuth,
+    checkPreconditions,
+    wrap((req, res) => {
+      const updated = store.extendDeadline(id(req), clientOf(req), req.body?.fundingDeadline);
+      setEtag(res, updated);
+      return updated;
+    }),
+  );
+  v1.post(
     '/contracts/:id/deposit',
     requireAuth,
     validate({ params: IdParam, body: DepositBody }),
-    wrap((req) => store.deposit(Number(req.params.id), req.body.amount, callerOf(req))),
+    checkPreconditions,
+    wrap((req, res) => {
+      const updated = store.deposit(Number(req.params.id), req.body.amount, callerOf(req));
+      setEtag(res, updated);
+      maybeAttachReceipt(req, res, updated);
+      return updated;
+    }),
   );
   v1.post(
     '/contracts/:id/milestones/:index/release',
     requireAuth,
     validate({ params: MilestoneReleaseParams }),
-    wrap((req) => store.release(Number(req.params.id), Number(req.params.index), callerOf(req))),
+    checkPreconditions,
+    wrap((req, res) => {
+      const updated = store.release(Number(req.params.id), Number(req.params.index), callerOf(req));
+      setEtag(res, updated);
+      maybeAttachReceipt(req, res, updated);
+      return updated;
+    }),
   );
   v1.post(
     '/contracts/:id/dispute',
     requireAuth,
     validate({ params: IdParam, body: DisputeBody }),
-    wrap((req) => store.openDispute(Number(req.params.id), req.body.raisedBy, req.body.reason, callerOf(req))),
+    checkPreconditions,
+    wrap((req, res) => {
+      const updated = store.openDispute(Number(req.params.id), req.body.raisedBy, req.body.reason, callerOf(req));
+      setEtag(res, updated);
+      maybeAttachReceipt(req, res, updated);
+      return updated;
+    }),
   );
   v1.post(
     '/contracts/:id/resolve',
     validate({ params: IdParam, body: ResolveBody }),
-    wrap((req) => store.resolveDispute(Number(req.params.id), req.body.freelancerBps)),
+    checkPreconditions,
+    wrap((req, res) => {
+      const updated = store.resolveDispute(Number(req.params.id), req.body.freelancerBps);
+      setEtag(res, updated);
+      maybeAttachReceipt(req, res, updated);
+      return updated;
+    }),
   );
   v1.post(
     '/contracts/:id/cancel',
     requireAuth,
     validate({ params: IdParam, body: CancelBody }),
-    wrap((req) => store.cancel(Number(req.params.id), callerOf(req))),
+    checkPreconditions,
+    wrap((req, res) => {
+      const updated = store.cancel(Number(req.params.id), callerOf(req));
+      setEtag(res, updated);
+      maybeAttachReceipt(req, res, updated);
+      return updated;
+    }),
   );
   v1.post(
     '/contracts/:id/reputation',
     requireAuth,
     validate({ params: IdParam, body: RateBody }),
-    wrap((req) => store.rate(Number(req.params.id), req.body.rating, callerOf(req))),
+    checkPreconditions,
+    wrap((req, res) => {
+      const reputation = store.rate(Number(req.params.id), req.body.rating, callerOf(req));
+      // The ETag and receipt cover the contract (now reputationIssued), not the reputation summary.
+      const contract = store.get(Number(req.params.id));
+      setEtag(res, contract);
+      maybeAttachReceipt(req, res, contract);
+      return reputation;
+    }),
   );
   v1.get(
     '/reputation/:address',
@@ -479,7 +771,67 @@ export function createApp(
       });
     }),
   );
+  v1.post(
+    '/receipts/verify',
+    wrap((req) => {
+      const receipt = req.body?.receipt;
+      if (!receipt || typeof receipt !== 'string') {
+        throw new HttpError(400, 'invalid_receipt', 'receipt must be a non-empty JWS string');
+      }
+      const verified = verifyReceipt(receipt, receiptManager().publicKey);
+      if (!verified.valid) {
+        return {
+          valid: false,
+          kid: verified.kid ?? null,
+          iat: verified.iat ?? null,
+          contractId: verified.contractId ?? null,
+          matchesCurrent: false,
+        };
+      }
+      let matchesCurrent = false;
+      if (verified.contractId) {
+        try {
+          matchesCurrent = hashContractState(store.get(verified.contractId)) === verified.contractHash;
+        } catch {
+          matchesCurrent = false;
+        }
+      }
+      return { valid: true, kid: verified.kid, iat: verified.iat, contractId: verified.contractId, matchesCurrent };
+    }),
+  );
+
   app.use('/api/v1', v1);
+
+  // Daily Vercel cron (see vercel.json); also callable manually with the bearer secret.
+  const expireContracts = wrap((req) => {
+    requireCronSecret(req);
+    const checkedAt = store.currentTime();
+    return { expired: store.sweepExpired(), checkedAt };
+  });
+  app.get('/api/cron/expire-contracts', expireContracts);
+  app.post('/api/cron/expire-contracts', expireContracts);
+
+  // Prometheus scrape endpoint; disabled (404) unless METRICS_TOKEN is set, checked per request.
+  const escrowContracts = registry.gauge('escrow_contracts', 'Escrow contracts by status', ['status']);
+  const escrowValueEscrowed = registry.gauge('escrow_value_escrowed', 'Value currently escrowed (base units)', []);
+  const escrowValueReleased = registry.gauge('escrow_value_released', 'Value released (base units)', []);
+  const processUptime = registry.gauge('process_uptime_seconds', 'Process uptime in seconds', []);
+  const nodejsHeapUsed = registry.gauge('nodejs_heap_used_bytes', 'Node.js heap used in bytes', []);
+  app.get('/metrics', (req, res, next) => {
+    const token = process.env.METRICS_TOKEN;
+    if (!token) return next(new HttpError(404, 'not_found', 'Metrics endpoint disabled'));
+    const auth = req.headers.authorization;
+    if (!auth || !constantTimeEqual(auth, `Bearer ${token}`)) {
+      return next(new HttpError(401, 'unauthorized', 'Invalid metrics token'));
+    }
+    const stats = store.stats();
+    for (const [status, count] of Object.entries(stats.byStatus)) escrowContracts.set({ status }, count);
+    escrowValueEscrowed.set({}, stats.totalEscrowed);
+    escrowValueReleased.set({}, stats.totalReleased);
+    processUptime.set({}, process.uptime());
+    nodejsHeapUsed.set({}, process.memoryUsage().heapUsed);
+    res.type('text/plain; version=0.0.4').send(registry.exposition());
+  });
 
   app.use((req, res) => {
     res.status(404).json({ error: 'not_found', message: `No route for ${req.method} ${req.path}`, requestId: req.id, docs: '/docs' });
@@ -490,18 +842,11 @@ export function createApp(
     const requestId = req.id;
     if (err instanceof PreconditionFailedError) {
       res.setHeader('ETag', err.currentEtag);
-      res.status(412).json({
-        error: err.code,
-        message: err.message,
-        currentVersion: err.currentVersion,
-      });
+      res.status(412).json({ error: err.code, message: err.message, currentVersion: err.currentVersion });
       return;
     }
     if (err instanceof PreconditionRequiredError) {
-      res.status(428).json({
-        error: err.code,
-        message: err.message,
-      });
+      res.status(428).json({ error: err.code, message: err.message });
       return;
     }
     if (err instanceof HttpError) {

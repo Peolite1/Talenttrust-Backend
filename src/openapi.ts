@@ -12,6 +12,19 @@ const errorResponse = (description: string, schema: object = { $ref: '#/componen
 const created = (description: string, schema: object = { type: 'object' }) => ({
   201: { description, content: json(schema) },
 });
+const receiptQueryParam = {
+  name: 'receipt',
+  in: 'query',
+  required: false,
+  schema: { type: 'boolean' },
+  description: 'When true, includes detached JWS Receipt header for the contract state',
+};
+const receiptHeaders = {
+  Receipt: {
+    schema: { type: 'string' },
+    description: 'Detached compact JWS receipt of post-mutation contract state',
+  },
+};
 
 const validationErrorResponse = {
   400: {
@@ -146,8 +159,73 @@ const spec = {
     { name: 'Contracts' },
     { name: 'Reputation' },
     { name: 'Transaction' },
+    { name: 'Receipts' },
+    { name: 'Cron' },
   ],
   paths: {
+    '/metrics': {
+      get: {
+        tags: ['System'],
+        summary: 'Prometheus metrics endpoint',
+        description:
+          'Returns Prometheus exposition format text (HTTP RED metrics by route pattern, escrow gauges, ' +
+          '`escrow_mutations_total{action,result}`, process metrics). Requires `Authorization: Bearer <METRICS_TOKEN>`. ' +
+          'Returns 404 when METRICS_TOKEN is unset (endpoint disabled).',
+        security: [{ metricsToken: [] }],
+        responses: {
+          200: { description: 'Prometheus exposition format', content: { 'text/plain': { schema: { type: 'string' } } } },
+          401: errorResponse('Invalid or missing metrics token'),
+          404: errorResponse('Metrics endpoint disabled (METRICS_TOKEN not set)'),
+        },
+      },
+    },
+    '/api/cron/expire-contracts': {
+      get: {
+        tags: ['Cron'],
+        summary: 'Expire due unfunded contracts',
+        description:
+          'Daily sweep (Vercel cron) that moves still-unfunded `Created` contracts past their funding deadline ' +
+          'to `Expired`, refunding any partial funding. Also accepts POST. Requires `Authorization: Bearer ' +
+          '<CRON_SECRET>`; returns 404 when `CRON_SECRET` is not configured.',
+        parameters: [{ name: 'Authorization', in: 'header', required: true, schema: { type: 'string' } }],
+        responses: {
+          ...ok('Sweep result', {
+            type: 'object',
+            required: ['expired', 'checkedAt'],
+            properties: {
+              expired: { type: 'array', items: { type: 'integer' } },
+              checkedAt: { type: 'string', format: 'date-time' },
+            },
+          }),
+          401: errorResponse('Invalid or missing bearer secret (cron_unauthorized)'),
+          404: errorResponse('Cron secret is not configured'),
+        },
+      },
+    },
+    '/api/v1/contracts/{id}/extend-deadline': {
+      post: {
+        tags: ['Contracts'],
+        summary: 'Extend a contract funding deadline (client only)',
+        parameters: [idParam],
+        requestBody: {
+          required: true,
+          content: json({
+            type: 'object',
+            required: ['client', 'fundingDeadline'],
+            properties: {
+              client: { type: 'string' },
+              fundingDeadline: { type: 'string', format: 'date-time', description: 'Later than the current deadline, at most 90 days from now' },
+            },
+          }),
+        },
+        responses: {
+          ...ok('Deadline extended', contractRef),
+          400: errorResponse('Invalid deadline (invalid_deadline)'),
+          403: errorResponse('Caller is not the client'),
+          409: errorResponse('Contract has expired (contract_expired)'),
+        },
+      },
+    },
     '/api/v1/auth/challenge': {
       get: {
         tags: ['Auth'],
@@ -185,6 +263,13 @@ const spec = {
       },
     },
     '/health': { get: { tags: ['System'], summary: 'Health check', responses: ok('Service is healthy') } },
+    '/.well-known/talenttrust-receipts.json': {
+      get: {
+        tags: ['Receipts'],
+        summary: 'Published ed25519 public keys for offline JWS receipt verification',
+        responses: ok('Published keys', { $ref: '#/components/schemas/PublishedKeys' }),
+      },
+    },
     '/api/v1/chain': {
       get: { tags: ['System'], summary: 'On-chain escrow contract deployment info', responses: ok('Deployment') },
     },
@@ -226,26 +311,49 @@ const spec = {
     '/api/v1/contracts': {
       get: {
         tags: ['Contracts'],
-        summary: 'List escrow contracts',
+        summary: 'List escrow contracts with cursor pagination, sorting and filters',
         description:
-          'Returns an array of contracts. Supports filtering by `status` or `party` address. ' +
+          'Returns a page of contracts (`data`) plus `page: { limit, nextCursor, hasMore }`. Pass ' +
+          '`page.nextCursor` back as `cursor` (with the same `sort`) for the next page; ties are broken by id. ' +
           'Use `?fields=` to request a sparse response — only the listed fields are included, ' +
           'reducing payload size for list views.',
         parameters: [
-          { name: 'status', in: 'query', schema: { type: 'string', enum: ['Created', 'Funded', 'Completed', 'Disputed', 'Resolved', 'Cancelled'] } },
+          { name: 'limit', in: 'query', schema: { type: 'integer', minimum: 1, maximum: 100, default: 20 }, description: 'Page size' },
+          { name: 'cursor', in: 'query', schema: { type: 'string' }, description: 'Opaque cursor returned in `page.nextCursor`' },
+          { name: 'sort', in: 'query', schema: { type: 'string', enum: ['createdAt', '-createdAt', 'updatedAt', '-updatedAt', 'totalAmount', '-totalAmount'], default: '-createdAt' }, description: 'Sort field and direction' },
+          { name: 'status', in: 'query', schema: { type: 'string' }, description: 'Comma-separated list of statuses (Created, Funded, Completed, Disputed, Resolved, Cancelled, Expired)' },
           { name: 'party', in: 'query', schema: { type: 'string', maxLength: 64 }, description: 'Client or freelancer address' },
+          { name: 'role', in: 'query', schema: { type: 'string', enum: ['client', 'freelancer'] }, description: 'Restricts `party` to the given role; requires `party`' },
+          { name: 'token', in: 'query', schema: { type: 'string' }, description: 'Exact token match' },
+          { name: 'createdAfter', in: 'query', schema: { type: 'string', format: 'date-time' }, description: 'ISO-8601 lower bound on createdAt' },
+          { name: 'createdBefore', in: 'query', schema: { type: 'string', format: 'date-time' }, description: 'ISO-8601 upper bound on createdAt' },
           fieldsParam,
           { name: 'linked', in: 'query', schema: { type: 'boolean' }, description: 'Filter by whether contract is linked to on-chain escrow' },
-          ifNoneMatchHeader,
         ],
         responses: {
-          ...ok('Contracts', { type: 'object', properties: { data: { type: 'array', items: contractRef } } }),
-          ...fieldsError,
+          ...ok('Paginated contracts', {
+            type: 'object',
+            required: ['data', 'page'],
+            properties: {
+              data: { type: 'array', items: contractRef },
+              page: {
+                type: 'object',
+                required: ['limit', 'hasMore'],
+                properties: {
+                  limit: { type: 'integer' },
+                  nextCursor: { type: 'string', nullable: true },
+                  hasMore: { type: 'boolean' },
+                },
+              },
+            },
+          }),
+          400: errorResponse('invalid_query, invalid_cursor or invalid `?fields=` value'),
         },
       },
       post: {
         tags: ['Contracts'],
         summary: 'Create an escrow contract',
+        parameters: [receiptQueryParam],
         requestBody: {
           required: true,
           content: json({
@@ -256,6 +364,11 @@ const spec = {
               client: { type: 'string' },
               freelancer: { type: 'string' },
               token: { type: 'string', default: 'XLM' },
+              fundingDeadline: {
+                type: 'string',
+                format: 'date-time',
+                description: 'ISO-8601 deadline, from 1 hour through 90 days after creation (default 14 days)',
+              },
               milestones: milestonesSchema,
             },
           }),
@@ -341,6 +454,17 @@ const spec = {
           400: errorResponse('Invalid contract id'),
           404: errorResponse('Contract not found'),
         },
+      },
+    },
+    '/api/v1/contracts/{id}/receipt': {
+      get: {
+        tags: ['Receipts'],
+        summary: 'Get detached server-signed JWS receipt for a contract',
+        parameters: [idParam],
+        responses: ok('Contract receipt', {
+          type: 'object',
+          properties: { receipt: { type: 'string', description: 'Compact JWS receipt' } },
+        }),
       },
     },
     '/api/v1/contracts/{id}/deposit': {
@@ -513,9 +637,25 @@ const spec = {
         }),
       },
     },
+    '/api/v1/receipts/verify': {
+      post: {
+        tags: ['Receipts'],
+        summary: 'Verify a server-signed JWS receipt and check against current state',
+        requestBody: {
+          required: true,
+          content: json({
+            type: 'object',
+            required: ['receipt'],
+            properties: { receipt: { type: 'string', description: 'Compact JWS receipt string' } },
+          }),
+        },
+        responses: ok('Verification result', { $ref: '#/components/schemas/ReceiptVerification' }),
+      },
+    },
   },
   components: {
     securitySchemes: {
+      metricsToken: { type: 'http', scheme: 'bearer', description: 'Bearer token: METRICS_TOKEN' },
       bearerAuth: {
         type: 'http',
         scheme: 'bearer',
@@ -554,6 +694,15 @@ const spec = {
       },
     },
     schemas: {
+      PreconditionFailedResponse: {
+        type: 'object',
+        required: ['error', 'message', 'currentVersion'],
+        properties: {
+          error: { type: 'string', enum: ['precondition_failed'] },
+          message: { type: 'string' },
+          currentVersion: { type: 'integer' },
+        },
+      },
       ChallengeResponse: {
         type: 'object',
         required: ['address', 'challenge', 'expiresAt'],
@@ -653,6 +802,40 @@ const spec = {
         },
         required: ['error', 'message'],
       },
+      PublishedKeys: {
+        type: 'object',
+        properties: {
+          keys: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                kid: { type: 'string' },
+                alg: { type: 'string', enum: ['EdDSA'] },
+                publicKey: { type: 'string' },
+                jwk: {
+                  type: 'object',
+                  properties: {
+                    kty: { type: 'string', enum: ['OKP'] },
+                    crv: { type: 'string', enum: ['Ed25519'] },
+                    x: { type: 'string' },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+      ReceiptVerification: {
+        type: 'object',
+        properties: {
+          valid: { type: 'boolean' },
+          kid: { type: 'string', nullable: true },
+          iat: { type: 'integer', nullable: true },
+          contractId: { type: 'integer', nullable: true },
+          matchesCurrent: { type: 'boolean' },
+        },
+      },
       Error: {
         type: 'object',
         properties: { error: { type: 'string' }, message: { type: 'string' } },
@@ -708,8 +891,12 @@ const spec = {
             type: 'string',
             description: 'Canonical decimal string released amount in token base units.',
           },
-          status: { type: 'string', enum: ['Created', 'Funded', 'Completed', 'Disputed', 'Resolved', 'Cancelled'] },
+          status: { type: 'string', enum: ['Created', 'Funded', 'Completed', 'Disputed', 'Resolved', 'Cancelled', 'Expired'] },
           reputationIssued: { type: 'boolean' },
+          fundingDeadline: { type: 'string', format: 'date-time' },
+          expiredAt: { type: 'string', format: 'date-time' },
+          refundableAmount: { type: 'number', description: 'DEPRECATED — lossy above 2^53. Use refundableAmountUnits.' },
+          refundableAmountUnits: { type: 'string', description: 'Partial funding returned to the client on expiry (base units).' },
           dispute: {
             type: 'object',
             nullable: true,
@@ -723,6 +910,7 @@ const spec = {
           },
           chain: { $ref: '#/components/schemas/ChainInfo' },
           revision: { type: 'integer', minimum: 1, description: 'Term revision; increments on every edit.' },
+          version: { type: 'integer', minimum: 1, description: 'Entity version behind the ETag; increments on every state change.' },
           createdAt: { type: 'string', format: 'date-time' },
           updatedAt: { type: 'string', format: 'date-time' },
         },
@@ -908,6 +1096,7 @@ const spec = {
           client: { type: 'string', minLength: 1 },
           freelancer: { type: 'string', minLength: 1 },
           token: { type: 'string', maxLength: 64 },
+          fundingDeadline: { type: 'string', format: 'date-time' },
           milestones: {
             type: 'array',
             minItems: 1,
@@ -992,6 +1181,7 @@ const PROTECTED: Array<[string, string]> = [
   ['/api/v1/contracts/{id}', 'patch'],
   ['/api/v1/contracts/{id}', 'delete'],
   ['/api/v1/contracts/{id}/deposit', 'post'],
+  ['/api/v1/contracts/{id}/extend-deadline', 'post'],
   ['/api/v1/contracts/{id}/milestones/{index}/release', 'post'],
   ['/api/v1/contracts/{id}/dispute', 'post'],
   ['/api/v1/contracts/{id}/cancel', 'post'],
@@ -1015,7 +1205,96 @@ function withBearerAuth<T extends { paths: object }>(doc: T): T {
   return doc;
 }
 
-export const openapi = withBearerAuth(withIdempotency(spec));
+/** Mutations that accept `?receipt=true` and then return a signed `Receipt` header. */
+const RECEIPT_OPS = [
+  '/api/v1/contracts',
+  '/api/v1/contracts/{id}/deposit',
+  '/api/v1/contracts/{id}/milestones/{index}/release',
+  '/api/v1/contracts/{id}/dispute',
+  '/api/v1/contracts/{id}/resolve',
+  '/api/v1/contracts/{id}/cancel',
+  '/api/v1/contracts/{id}/reputation',
+];
+
+/** Documents the `receipt` query parameter and `Receipt` response header on receipt-capable mutations. */
+function withReceipts<T extends { paths: object }>(doc: T): T {
+  const paths = doc.paths as Record<string, { post?: Operation }>;
+  for (const path of RECEIPT_OPS) {
+    const op = paths[path]?.post;
+    if (!op) continue;
+    if (!(op.parameters ?? []).includes(receiptQueryParam)) op.parameters = [...(op.parameters ?? []), receiptQueryParam];
+    for (const code of ['200', '201']) {
+      const r = op.responses[code] as { $ref?: string; headers?: object } | undefined;
+      if (r && !r.$ref) r.headers = { ...(r.headers ?? {}), ...receiptHeaders };
+    }
+  }
+  return doc;
+}
+
+const etagHeader = {
+  ETag: { description: 'Strong entity tag (`"<id>-<version>"` for a contract)', schema: { type: 'string' } },
+};
+const ifNoneMatchHeader = {
+  name: 'If-None-Match',
+  in: 'header',
+  required: false,
+  description: 'Entity tag(s) from a previous response; returns 304 Not Modified when current',
+  schema: { type: 'string' },
+};
+const ifMatchHeader = {
+  name: 'If-Match',
+  in: 'header',
+  required: false,
+  description:
+    'Current entity tag (`"<id>-<version>"` or `*`) for optimistic concurrency. Required when the server runs ' +
+    'with REQUIRE_IF_MATCH=true.',
+  schema: { type: 'string' },
+};
+
+/** Documents ETag/If-None-Match on contract reads and If-Match (412/428) on contract mutations. */
+function withEtags<T extends { paths: object }>(doc: T): T {
+  const paths = doc.paths as Record<string, Record<string, Operation | undefined>>;
+  for (const path of ['/api/v1/contracts', '/api/v1/contracts/{id}']) {
+    const op = paths[path]?.get;
+    if (!op) continue;
+    op.parameters = [...(op.parameters ?? []), ifNoneMatchHeader];
+    const r = op.responses['200'] as { headers?: object } | undefined;
+    if (r) r.headers = { ...(r.headers ?? {}), ...etagHeader };
+    op.responses = { ...op.responses, 304: { description: 'Not Modified - cached representation is current' } };
+  }
+  const mutations: Array<[string, string]> = [
+    ['/api/v1/contracts/{id}', 'patch'],
+    ['/api/v1/contracts/{id}', 'delete'],
+    ['/api/v1/contracts/{id}/extend-deadline', 'post'],
+    ['/api/v1/contracts/{id}/deposit', 'post'],
+    ['/api/v1/contracts/{id}/milestones/{index}/release', 'post'],
+    ['/api/v1/contracts/{id}/dispute', 'post'],
+    ['/api/v1/contracts/{id}/resolve', 'post'],
+    ['/api/v1/contracts/{id}/cancel', 'post'],
+    ['/api/v1/contracts/{id}/reputation', 'post'],
+  ];
+  for (const [path, method] of mutations) {
+    const op = paths[path]?.[method];
+    if (!op) continue;
+    op.parameters = [...(op.parameters ?? []), ifMatchHeader];
+    const r = op.responses['200'] as { $ref?: string; headers?: object } | undefined;
+    if (r && !r.$ref) r.headers = { ...(r.headers ?? {}), ...etagHeader };
+    op.responses = {
+      ...op.responses,
+      412: {
+        description: 'Precondition Failed - If-Match does not match the current ETag',
+        headers: etagHeader,
+        content: json({ $ref: '#/components/schemas/PreconditionFailedResponse' }),
+      },
+      428: errorResponse('Precondition Required - If-Match missing while REQUIRE_IF_MATCH=true'),
+    };
+  }
+  const created = (paths['/api/v1/contracts']?.post?.responses['201'] ?? undefined) as { headers?: object } | undefined;
+  if (created) created.headers = { ...(created.headers ?? {}), ...etagHeader };
+  return doc;
+}
+
+export const openapi = withEtags(withBearerAuth(withIdempotency(withReceipts(spec))));
 
 export const docsHtml = `<!doctype html>
 <html lang="en">
