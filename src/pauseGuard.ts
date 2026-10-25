@@ -1,6 +1,3 @@
-import http from 'http';
-import https from 'https';
-import { URL } from 'url';
 import { config } from './config';
 
 export type PauseSource = 'chain' | 'env' | 'none';
@@ -40,72 +37,25 @@ export const GUARDED_ROUTES = [
 ] as const;
 
 /**
- * Default RPC reader that queries Soroban RPC via JSON-RPC `simulateTransaction`
- * or returns false if cannot parse or contract not deployed.
+ * Default RPC reader: simulates the escrow contract's read-only `is_paused()`
+ * via Soroban RPC (no signature or fee needed) and returns its boolean result.
+ * Rejects on RPC/simulation errors so the guard can apply PAUSE_FAIL_MODE.
  */
 export async function defaultRpcReader(): Promise<boolean> {
-  const rpcUrl = config.rpcUrl;
-  const parsedUrl = new URL(rpcUrl);
-  const client = parsedUrl.protocol === 'https:' ? https : http;
-
-  const payload = JSON.stringify({
-    jsonrpc: '2.0',
-    id: 1,
-    method: 'simulateTransaction',
-    params: {
-      // Contract call simulation payload or getContractData if supported
-      // For general Soroban JSON-RPC simulateTransaction or getHealth
-      contractId: config.contractId,
-    },
-  });
-
-  return new Promise((resolve, reject) => {
-    const req = client.request(
-      parsedUrl,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(payload),
-        },
-        timeout: 5000,
-      },
-      (res) => {
-        let data = '';
-        res.on('data', (chunk) => {
-          data += chunk;
-        });
-        res.on('end', () => {
-          try {
-            if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-              const json = JSON.parse(data);
-              if (json.error) {
-                // If RPC returns an error
-                reject(new Error(json.error.message || 'RPC error'));
-                return;
-              }
-              // Parse boolean result from simulation if present
-              // By default if simulateTransaction returns false / unpaused
-              resolve(Boolean(json.result?.paused ?? false));
-            } else {
-              reject(new Error(`RPC responded with status ${res.statusCode}`));
-            }
-          } catch (e) {
-            reject(e);
-          }
-        });
-      },
-    );
-
-    req.on('error', (err) => reject(err));
-    req.on('timeout', () => {
-      req.destroy();
-      reject(new Error('RPC request timed out'));
-    });
-
-    req.write(payload);
-    req.end();
-  });
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const StellarSdk = require('@stellar/stellar-sdk');
+  const networkPassphrase = config.network === 'mainnet' ? StellarSdk.Networks.PUBLIC : StellarSdk.Networks.TESTNET;
+  const server = new StellarSdk.rpc.Server(config.rpcUrl, { timeout: 5000 });
+  // Simulation only needs a syntactically valid source account; it is never signed or submitted.
+  const source = new StellarSdk.Account('GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7', '0');
+  const tx = new StellarSdk.TransactionBuilder(source, { fee: '100', networkPassphrase })
+    .addOperation(new StellarSdk.Contract(config.contractId).call('is_paused'))
+    .setTimeout(30)
+    .build();
+  const sim = await server.simulateTransaction(tx);
+  if (StellarSdk.rpc.Api.isSimulationError(sim)) throw new Error(String(sim.error));
+  const retval = sim.result?.retval;
+  return retval ? Boolean(StellarSdk.scValToNative(retval)) : false;
 }
 
 export interface PauseGuardOptions {
@@ -123,7 +73,12 @@ export class PauseGuard {
   private lastCheckedAt: number = 0;
   private inFlightPromise: Promise<boolean> | null = null;
 
+  private injectedReader: boolean;
+  private forcePaused: boolean;
+
   constructor(options: PauseGuardOptions = {}) {
+    this.forcePaused = options.apiPaused === true;
+    this.injectedReader = options.rpcReader !== undefined;
     this.rpcReader = options.rpcReader ?? defaultRpcReader;
     this.ttlMs = options.ttlMs ?? config.pauseCheckTtlMs;
     this.failMode = options.failMode ?? config.pauseFailMode;
@@ -134,13 +89,18 @@ export class PauseGuard {
     const checkedAt = new Date(now).toISOString();
 
     // 1. Check operator override (env)
-    const isEnvPaused = process.env.API_PAUSED === 'true' || config.apiPaused;
+    const isEnvPaused = this.forcePaused || process.env.API_PAUSED === 'true' || config.apiPaused;
     if (isEnvPaused) {
       return {
         paused: true,
         source: 'env',
         checkedAt,
       };
+    }
+
+    // Chain probe disabled (PAUSE_CHECK_CHAIN=false): only the operator override applies.
+    if (!this.checkChain()) {
+      return { paused: false, source: 'none', checkedAt };
     }
 
     // 2. Check cached chain pause status
@@ -188,6 +148,27 @@ export class PauseGuard {
         };
       }
     }
+  }
+
+  /** Last known status without waiting on RPC (for /health); refreshes in the background when stale. */
+  peek(): PauseStatus {
+    const now = Date.now();
+    if (this.forcePaused || process.env.API_PAUSED === 'true' || config.apiPaused) {
+      return { paused: true, source: 'env', checkedAt: new Date(now).toISOString() };
+    }
+    if (this.checkChain() && (this.cachedChainPaused === null || now - this.lastCheckedAt >= this.ttlMs)) {
+      void this.isPaused().catch(() => undefined);
+    }
+    const paused = this.cachedChainPaused === true;
+    return {
+      paused,
+      source: paused ? 'chain' : 'none',
+      checkedAt: new Date(this.lastCheckedAt || now).toISOString(),
+    };
+  }
+
+  private checkChain(): boolean {
+    return this.injectedReader || process.env.PAUSE_CHECK_CHAIN !== 'false';
   }
 
   clearCache(): void {

@@ -37,6 +37,7 @@ export function validate(schemas: { params?: ZodTypeAny; query?: ZodTypeAny; bod
   return (req: Request, _res: Response, next: NextFunction): void => {
     const details: ValidationDetail[] = [];
     let amountOnly = true;
+    let idOnly = true;
     const parsed: Partial<Record<Location, unknown>> = {};
     for (const loc of ['params', 'query', 'body'] as const) {
       const schema = schemas[loc];
@@ -48,11 +49,14 @@ export function validate(schemas: { params?: ZodTypeAny; query?: ZodTypeAny; bod
       } else {
         details.push(...formatZodError(result.error, loc));
         if (loc !== 'body' || !result.error.issues.every((i) => isAmountIssue(i.path))) amountOnly = false;
+        if (loc !== 'params' || !result.error.issues.every((i) => i.path.length === 1 && i.path[0] === 'id')) idOnly = false;
       }
     }
     if (details.length > 0) {
       const message = details.map((d) => `${d.path}: ${d.message}`).join('; ');
-      next(new HttpError(400, amountOnly ? 'invalid_amount' : 'validation_failed', message, { details }));
+      // Keep the established codes when the only problem is the amount or the path id.
+      const code = amountOnly ? 'invalid_amount' : idOnly ? 'invalid_id' : 'validation_failed';
+      next(new HttpError(400, code, message, { details }));
       return;
     }
     if (parsed.params) req.params = parsed.params as Record<string, string>;

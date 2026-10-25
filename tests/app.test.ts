@@ -368,16 +368,17 @@ describe('response compression', () => {
     // supertest auto-decompresses the body, so we verify the headers and
     // that the parsed body is valid JSON with the expected structure.
     const res = await request(app)
-      .get('/api/v1/contracts')
+      .get('/api/v1/contracts?limit=100')
       .set('Accept-Encoding', 'gzip')
       .expect(200);
 
     expect(res.headers['content-encoding']).toBe('gzip');
     expect(res.headers['vary']).toMatch(/Accept-Encoding/i);
 
-    // Body is valid JSON (supertest decompresses automatically)
+    // Body is valid JSON (supertest decompresses automatically). The list is
+    // paginated (max 100 per page), so request the largest page.
     expect(Array.isArray(res.body.data)).toBe(true);
-    expect(res.body.data.length).toBe(200);
+    expect(res.body.data.length).toBe(100);
   });
 
   it('does not compress small responses (< 1 KB) even with Accept-Encoding: gzip', async () => {
